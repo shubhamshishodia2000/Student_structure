@@ -4,6 +4,8 @@ Annual snapshots remain available to rebuild school history. Local Parquet is st
 """
 from __future__ import annotations
 
+from student_structure_history import baseline, record_history
+
 import argparse
 import subprocess
 import sys
@@ -378,6 +380,11 @@ def publish(spec: TableSpec, expected_rows: int) -> int:
                 f"{spec.table}: load mismatch expected={expected_rows:,}, files={loaded:,}, stage={stage_count:,}"
             )
 
+        # Capture the previous snapshot once, then compare every business field.
+        history_table = spec.table + "_history"
+        baseline(conn, SILVER_DB, spec.table, history_table, spec.keys)
+        record_history(conn, SILVER_DB, stage_table, history_table, spec.keys)
+
         query(
             conn,
             f"ALTER TABLE {ident(SILVER_DB)}.{ident(spec.table)} "
@@ -587,7 +594,7 @@ def preflight() -> None:
         conn.close()
 
 
-def build_silver() -> dict[str, int]:
+def prepare_silver() -> dict[str, int]:
     banner("BUILD STUDENT STRUCTURE SILVER")
     spark = make_spark("UDISE_Student_Structure_Silver")
     try:
@@ -630,17 +637,35 @@ def build_silver() -> dict[str, int]:
             rows = write_stage(df, spec)
             if rows <= 0:
                 raise RuntimeError(f"{name}: zero Silver rows")
-            published[name] = publish(spec, rows)
+            published[name] = rows
 
-        print("SILVER: PASS")
+        print("SILVER PARQUET: PASS (Doris publication runs after this process exits)")
         return published
     finally:
         spark.stop()
 
 
+def publish_silver() -> dict[str, int]:
+    banner("PUBLISH SILVER AND HISTORY (SPARK PROCESS HAS EXITED)")
+    published = {}
+    for name, spec in SPECS.items():
+        rows = parquet_row_count(spec.local_path)
+        if rows <= 0:
+            raise RuntimeError(f"{name}: missing or empty staged Parquet")
+        published[name] = publish(spec, rows)
+    print("SILVER: PASS")
+    return published
+
+
+def build_silver() -> dict[str, int]:
+    preflight()
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "--stage", "prepare"], check=True)
+    return publish_silver()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("normalize", "all"), default="all")
+    parser.add_argument("--stage", choices=("prepare", "publish", "normalize", "all"), default="all")
     args = parser.parse_args()
     if args.stage == "all":
         # Run Spark in a child process so its JVM exits before Doris SQL starts.
@@ -653,8 +678,11 @@ def main() -> None:
              "--stage", "silver"],
             check=True,
         )
+    elif args.stage == "prepare":
+        prepare_silver()
+    elif args.stage == "publish":
+        publish_silver()
     else:
-        preflight()
         build_silver()
 
 

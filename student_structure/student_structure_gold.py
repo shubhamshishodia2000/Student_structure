@@ -14,11 +14,12 @@ def main():
         if args.stage != "validate":
             model.ensure_databases(conn)
             # Check the detailed model before changing any report data.
-            for table in ("dim_state", "dim_management", "fact_student_structure"):
+            for table in ("dim_state", "dim_management", "dim_category", "fact_student_structure"):
                 if not model.table_exists(conn, model.SILVER_DB, table):
                     raise RuntimeError(f"Missing {model.SILVER_DB}.{table}; run Silver first")
             model.ensure_tables(conn, layer="gold")
             model.build_summary(conn)
+            model.build_category_report(conn)
         model.validate(conn)
     finally:
         conn.close()

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import uuid
+from student_structure_history import baseline, record_history
 from typing import Iterable
 
 from doris_io import connect, healthy, query
@@ -81,6 +83,18 @@ def ensure_databases(conn) -> None:
         raise ValueError("Silver and Gold must use different databases")
     execute(conn, f"CREATE DATABASE IF NOT EXISTS {ident(DW_DB)}")
     execute(conn, f"CREATE DATABASE IF NOT EXISTS {ident(GOLD_DB)}")
+
+
+def migrate_management_report(conn):
+    """Rename the old report once; never guess if both names already exist."""
+    old = table_exists(conn, GOLD_DB, "student_structure_summary")
+    new = table_exists(conn, GOLD_DB, "student_structure_management")
+    if old and new:
+        raise RuntimeError("Both student_structure_summary and student_structure_management exist. "
+                           "Rename the retired summary table to a backup name, then rerun.")
+    if old:
+        execute(conn, f"ALTER TABLE {qname(GOLD_DB, 'student_structure_summary')} "
+                      f"RENAME {ident('student_structure_management')}")
 
 
 def ensure_tables(conn, *, layer: str) -> None:
@@ -254,7 +268,7 @@ def ensure_tables(conn, *, layer: str) -> None:
         PROPERTIES ("replication_num" = "{REPLICATION_NUM}")
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, 'student_structure_summary')} (
+        CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, 'student_structure_management')} (
             ac_year VARCHAR(7) NOT NULL,
             india_state_ut VARCHAR(160) NOT NULL,
             management VARCHAR(64) NOT NULL,
@@ -272,6 +286,23 @@ def ensure_tables(conn, *, layer: str) -> None:
     if layer not in {"silver", "gold"}:
         raise ValueError("layer must be silver or gold")
     selected = ddl[:-1] if layer == "silver" else ddl[-1:]
+    if layer == "gold":
+        migrate_management_report(conn)
+        selected.append(f"""
+            CREATE TABLE IF NOT EXISTS {qname(GOLD_DB, 'student_structure_category')} (
+                ac_year VARCHAR(7) NOT NULL,
+                india_state_ut VARCHAR(160) NOT NULL,
+                category VARCHAR(128) NOT NULL,
+                total BIGINT NOT NULL,
+                government BIGINT NOT NULL,
+                government_aided BIGINT NOT NULL,
+                private_unaided_recognized BIGINT NOT NULL,
+                others BIGINT NOT NULL
+            )
+            DUPLICATE KEY (ac_year, india_state_ut, category)
+            DISTRIBUTED BY HASH(ac_year) BUCKETS 2
+            PROPERTIES ("replication_num"="{REPLICATION_NUM}")
+        """)
     for statement in selected:
         execute(conn, statement)
 
@@ -723,7 +754,7 @@ def stage_total(alias: str, levels: Iterable[str]) -> str:
     )
 
 
-def build_fact(conn) -> None:
+def _build_fact(conn, target_table) -> None:
     banner("BUILD fact_student_structure")
     stages = {
         "foundational": ("pp3", "pp2", "pp1", "c1", "c2"),
@@ -744,11 +775,11 @@ def build_fact(conn) -> None:
     expressions["total_transgender"] = " + ".join(f"({expressions[f'{stage}_transgender']})" for stage in stages)
     expressions["total_enrollment"] = " + ".join(f"({expressions[stage]})" for stage in stages)
 
-    execute(conn, f"TRUNCATE TABLE {qname(DW_DB, 'fact_student_structure')}")
+    execute(conn, f"TRUNCATE TABLE {qname(DW_DB, target_table)}")
     execute(
         conn,
         f"""
-        INSERT INTO {qname(DW_DB, 'fact_student_structure')}
+        INSERT INTO {qname(DW_DB, target_table)}
         SELECT
             ay.academic_year_sk,
             s.school_sk,
@@ -797,7 +828,7 @@ def build_fact(conn) -> None:
     )
 
     source_rows = count_rows(conn, SILVER_DB, "enrollment_social_category")
-    fact_rows = count_rows(conn, DW_DB, "fact_student_structure")
+    fact_rows = count_rows(conn, DW_DB, target_table)
     if fact_rows != source_rows:
         raise RuntimeError(
             f"Fact row-count mismatch: Silver enrollment={source_rows:,}, fact={fact_rows:,}. "
@@ -809,7 +840,7 @@ def build_fact(conn) -> None:
             conn,
             f"""
             SELECT COUNT(*) AS n
-            FROM {qname(DW_DB, 'fact_student_structure')}
+            FROM {qname(DW_DB, target_table)}
             WHERE total_enrollment <> foundational + preparatory + middle + secondary
             """,
         )[0]["n"]
@@ -819,13 +850,14 @@ def build_fact(conn) -> None:
     print(f"fact_student_structure: {fact_rows:,} rows")
 
 
-def build_summary(conn) -> None:
+def _build_summary(conn, target_table) -> None:
     banner("BUILD presentation-ready Gold summary")
-    execute(conn, f"TRUNCATE TABLE {qname(GOLD_DB, 'student_structure_summary')}")
+    validate_gold_inputs(conn)
+    execute(conn, f"TRUNCATE TABLE {qname(GOLD_DB, target_table)}")
     execute(
         conn,
         f"""
-        INSERT INTO {qname(GOLD_DB, 'student_structure_summary')}
+        INSERT INTO {qname(GOLD_DB, target_table)}
         SELECT
             f.academic_year AS ac_year,
             s.state_name AS india_state_ut,
@@ -886,16 +918,16 @@ def build_summary(conn) -> None:
         """,
     )
 
-    rows = count_rows(conn, GOLD_DB, "student_structure_summary")
+    rows = count_rows(conn, GOLD_DB, target_table)
     if rows <= 0:
-        raise RuntimeError("student_structure_summary produced zero rows")
+        raise RuntimeError("student_structure_management produced zero rows")
 
     bad_math = int(
         query(
             conn,
             f"""
             SELECT COUNT(*) AS n
-            FROM {qname(GOLD_DB, 'student_structure_summary')}
+            FROM {qname(GOLD_DB, target_table)}
             WHERE total <> foundational + preparatory + middle + secondary
             """,
         )[0]["n"]
@@ -910,7 +942,7 @@ def build_summary(conn) -> None:
             ac_year,
             MAX(CASE WHEN management = 'All Management' THEN total END) AS all_management,
             SUM(CASE WHEN management <> 'All Management' THEN total ELSE 0 END) AS bucket_total
-        FROM {qname(GOLD_DB, 'student_structure_summary')}
+        FROM {qname(GOLD_DB, target_table)}
         WHERE india_state_ut = 'Available Source Total'
         GROUP BY ac_year
         ORDER BY ac_year
@@ -920,10 +952,10 @@ def build_summary(conn) -> None:
         if int(row["all_management"]) != int(row["bucket_total"]):
             raise RuntimeError(f"Management reconciliation failed: {row}")
 
-    print(f"student_structure_summary: {rows:,} rows")
+    print(f"student_structure_management: {rows:,} rows")
     print("Example user query:")
     print(
-        f"  SELECT * FROM {GOLD_DB}.student_structure_summary "
+        f"  SELECT * FROM {GOLD_DB}.student_structure_management "
         "WHERE ac_year='2025-26' AND management='All Management';"
     )
 
@@ -939,7 +971,8 @@ def validate(conn) -> None:
         (DW_DB, "dim_social_category"),
         (DW_DB, "dim_school_scd2"),
         (DW_DB, "fact_student_structure"),
-        (GOLD_DB, "student_structure_summary"),
+        (GOLD_DB, "student_structure_management"),
+        (GOLD_DB, "student_structure_category"),
     ]
     for database, table in required:
         if not table_exists(conn, database, table):
@@ -953,8 +986,8 @@ def validate(conn) -> None:
         conn,
         f"""
         SELECT ac_year, india_state_ut, management, total, foundational, preparatory, middle, secondary
-        FROM {qname(GOLD_DB, 'student_structure_summary')}
-        WHERE ac_year = (SELECT MAX(ac_year) FROM {qname(GOLD_DB, 'student_structure_summary')})
+        FROM {qname(GOLD_DB, 'student_structure_management')}
+        WHERE ac_year = (SELECT MAX(ac_year) FROM {qname(GOLD_DB, 'student_structure_management')})
           AND management = 'All Management'
         ORDER BY india_state_ut
         """,
@@ -962,9 +995,129 @@ def validate(conn) -> None:
     print("\nLatest-year All Management rows:")
     for row in latest:
         print(row)
+    validate_gold_inputs(conn)
+    validate_category_report(conn, "student_structure_category")
     print("VALIDATION: PASS")
 
 
+
+
+def build_versioned_current(conn, database, target, keys, builder, *, keep_history=True):
+    """Validate new current data, persist history, then atomically replace current."""
+    history = target + "_history"
+    stage = target + "__stage_" + uuid.uuid4().hex[:10]
+    execute(conn, f"CREATE TABLE {qname(database, stage)} LIKE {qname(database, target)}")
+    try:
+        builder(conn, stage)
+        if keep_history:
+            if database == GOLD_DB:
+                raise ValueError("Gold reports must not create history tables")
+            baseline(conn, database, target, history, keys)
+            record_history(conn, database, stage, history, keys)
+        execute(conn, f'ALTER TABLE {qname(database, target)} REPLACE WITH TABLE {ident(stage)} PROPERTIES ("swap"="true")')
+    finally:
+        execute(conn, f"DROP TABLE IF EXISTS {qname(database, stage)}")
+
+
+def build_fact(conn):
+    build_versioned_current(conn, DW_DB, "fact_student_structure",
+                            ("academic_year", "udise_sch_code", "item_group", "item_id"), _build_fact)
+
+
+def build_summary(conn):
+    build_versioned_current(conn, GOLD_DB, "student_structure_management",
+                            ("ac_year", "india_state_ut", "management"), _build_summary, keep_history=False)
+
+
+def validate_gold_inputs(conn):
+    """Prevent missing mappings or repeated dimensions from corrupting totals."""
+    for name, key in (("dim_state", "state_sk"), ("dim_management", "management_sk"),
+                      ("dim_category", "category_sk")):
+        bad = query(conn, f"SELECT COUNT(*) AS n FROM (SELECT {ident(key)} "
+                    f"FROM {qname(DW_DB, name)} GROUP BY {ident(key)} HAVING COUNT(*)>1) d")[0]["n"]
+        if int(bad):
+            raise RuntimeError(f"{name} has repeated dimension keys")
+    bad = query(conn, f"""
+        SELECT COUNT(*) AS n
+        FROM {qname(DW_DB, 'fact_student_structure')} f
+        LEFT JOIN {qname(DW_DB, 'dim_state')} s ON s.state_sk=f.state_sk
+        LEFT JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk=f.management_sk
+        LEFT JOIN {qname(DW_DB, 'dim_category')} c ON c.category_sk=f.category_sk
+        WHERE s.state_sk IS NULL OR s.state_name IS NULL OR TRIM(s.state_name)=''
+           OR m.management_sk IS NULL OR m.management_group IS NULL
+           OR m.management_group NOT IN ('Government','Government Aided','Private Unaided Recognized','Others')
+           OR (f.category_sk IS NOT NULL AND (c.category_sk IS NULL OR c.category IS NULL OR TRIM(c.category)=''))
+    """)[0]["n"]
+    if int(bad):
+        raise RuntimeError(f"Gold mapping validation failed for {bad} facts; correct Silver mappings")
+
+
+def category_insert_sql(target_table):
+    return f"""
+        INSERT INTO {qname(GOLD_DB, target_table)}
+        (ac_year, india_state_ut, category, total,
+         government, government_aided, private_unaided_recognized, others)
+        WITH mapped AS (
+            SELECT f.academic_year, s.state_name,
+                   COALESCE(c.category, 'Unknown') AS category,
+                   m.management_group, f.total_enrollment
+            FROM {qname(DW_DB, 'fact_student_structure')} f
+            JOIN {qname(DW_DB, 'dim_state')} s ON s.state_sk=f.state_sk
+            JOIN {qname(DW_DB, 'dim_management')} m ON m.management_sk=f.management_sk
+            LEFT JOIN {qname(DW_DB, 'dim_category')} c ON c.category_sk=f.category_sk
+        ), geographies AS (
+            SELECT academic_year, state_name AS geography, category,
+                   management_group, total_enrollment FROM mapped
+            UNION ALL
+            SELECT academic_year, 'Available Source Total' AS geography, category,
+                   management_group, total_enrollment FROM mapped
+        )
+        SELECT academic_year, geography, category, SUM(total_enrollment),
+               SUM(CASE WHEN management_group='Government' THEN total_enrollment ELSE 0 END),
+               SUM(CASE WHEN management_group='Government Aided' THEN total_enrollment ELSE 0 END),
+               SUM(CASE WHEN management_group='Private Unaided Recognized' THEN total_enrollment ELSE 0 END),
+               SUM(CASE WHEN management_group='Others' THEN total_enrollment ELSE 0 END)
+        FROM geographies
+        GROUP BY academic_year, geography, category
+    """
+
+
+def validate_category_report(conn, target_table):
+    target = qname(GOLD_DB, target_table)
+    if count_rows(conn, GOLD_DB, target_table) <= 0:
+        raise RuntimeError("student_structure_category produced zero rows")
+    bad = query(conn, f"SELECT COUNT(*) AS n FROM {target} "
+                "WHERE total<>government+government_aided+private_unaided_recognized+others")[0]["n"]
+    if int(bad):
+        raise RuntimeError("Category management columns do not reconcile to total")
+    mismatch = query(conn, f"""
+        WITH actual AS (
+            SELECT ac_year, india_state_ut, SUM(total) AS total
+            FROM {target} GROUP BY ac_year, india_state_ut
+        ), expected AS (
+            SELECT ac_year, india_state_ut, total
+            FROM {qname(GOLD_DB, 'student_structure_management')}
+            WHERE management='All Management'
+        )
+        SELECT COUNT(*) AS n
+        FROM actual a FULL OUTER JOIN expected e
+          ON a.ac_year=e.ac_year AND a.india_state_ut=e.india_state_ut
+        WHERE a.ac_year IS NULL OR e.ac_year IS NULL OR a.total<>e.total
+    """)[0]["n"]
+    if int(mismatch):
+        raise RuntimeError("Category totals differ from the final management report")
+
+
+def _build_category_report(conn, target_table):
+    validate_gold_inputs(conn)
+    execute(conn, category_insert_sql(target_table))
+    validate_category_report(conn, target_table)
+
+
+def build_category_report(conn):
+    build_versioned_current(conn, GOLD_DB, "student_structure_category",
+                            ("ac_year", "india_state_ut", "category"),
+                            _build_category_report, keep_history=False)
 
 
 def main() -> None:
